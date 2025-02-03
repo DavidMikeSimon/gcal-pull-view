@@ -1,0 +1,9 @@
+[package]
+name = "calsync"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+chrono = "0.4.39"
+ureq = "3.0.2"
+icalendar = { version = "0.16.11", features = ["chrono-tz"] }
