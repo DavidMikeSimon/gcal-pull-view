@@ -1,6 +1,8 @@
-use chrono::{prelude::*, Duration};
-use icalendar::{Calendar, CalendarComponent, Component, DatePerhapsTime};
-use ureq;
+use anyhow::Context;
+use chrono::prelude::*;
+use google_calendar3::{api::EventDateTime, hyper_rustls, hyper_util, yup_oauth2, CalendarHub};
+
+const DAYS_WINDOW: u64 = 7;
 
 #[derive(Debug)]
 struct Event {
@@ -9,80 +11,105 @@ struct Event {
     summary: String,
 }
 
-// const MAX_DISTANCE: Duration = Duration::days(14);
-const MAX_DISTANCE: Duration = Duration::days(5);
-const TARGET_EMAIL: &'static str = "david.simon@color.com";
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // let url =
-    //     std::env::var("GOOGLE_CALENDAR_ICAL_URL").expect("GOOGLE_CALENDAR_ICAL_URL must be set");
-    // let body = ureq::get(url).call()?.body_mut().read_to_string()?;
+    // Get an ApplicationSecret instance by some means. It contains the `client_id` and
+    // `client_secret`, among other things.
+    let secret: yup_oauth2::ApplicationSecret = yup_oauth2::read_application_secret("secret.json")
+        .await
+        .unwrap();
 
-    let body = std::fs::read_to_string("basic.ics")?;
+    // Instantiate the authenticator. It will choose a suitable authentication flow for you,
+    // unless you replace  `None` with the desired Flow.
+    // Provide your own `AuthenticatorDelegate` to adjust the way it operates and get feedback about
+    // what's going on. You probably want to bring in your own `TokenStorage` to persist tokens and
+    // retrieve them from storage.
+    let auth = yup_oauth2::InstalledFlowAuthenticator::builder(
+        secret,
+        yup_oauth2::InstalledFlowReturnMethod::Interactive,
+    )
+    .persist_tokens_to_disk("tokens.json")
+    .build()
+    .await
+    .unwrap();
 
-    let now = Utc::now();
+    let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+        .build(
+            hyper_rustls::HttpsConnectorBuilder::new()
+                .with_native_roots()
+                .unwrap()
+                .https_or_http()
+                .enable_http1()
+                .build(),
+        );
+    let hub = CalendarHub::new(client, auth);
 
-    let calendar: Calendar = body.parse()?;
+    let now = chrono::Utc::now();
 
-    let mut events: Vec<Event> = calendar
-        .components
+    let result = hub
+        .events()
+        .list("david.simon@color.com")
+        .add_event_types("default")
+        .max_results(2500)
+        .single_events(true)
+        .order_by("startTime")
+        .max_attendees(1)
+        .time_min(
+            now.checked_sub_days(chrono::Days::new(DAYS_WINDOW))
+                .context("Subtracting days")?,
+        )
+        .time_max(
+            now.checked_add_days(chrono::Days::new(DAYS_WINDOW))
+                .context("Adding days")?,
+        )
+        .doit()
+        .await?
+        .1;
+
+    let events = result
+        .items
+        .context("Calendar events should exist")?
         .iter()
-        .filter_map(|component| {
-            let event = component.as_event()?;
-
-            if !event.get_summary()?.to_string().contains("Geena / David") {
-                return None;
-            }
-
-            println!("{:?}", event);
-
-            let start = match event.get_start() {
-                Some(DatePerhapsTime::DateTime(start)) => start.try_into_utc()?,
-                _ => return None,
-            };
-
-            let end = match event.get_end() {
-                Some(DatePerhapsTime::DateTime(end)) => end.try_into_utc()?,
-                _ => return None,
-            };
-
-            // if start.signed_duration_since(now).abs() > MAX_DISTANCE {
-            //     return None;
-            // }
-
-            let attendee_match = event
-                .multi_properties()
-                .get("ATTENDEE")
-                .unwrap_or(&vec![])
-                .iter()
-                .any(|attendee| {
-                    let email = attendee.params().get("CN");
-                    let status = attendee.params().get("PARTSTAT");
-                    match (email, status) {
-                        (Some(email), Some(status)) => {
-                            email.value() == TARGET_EMAIL && status.value() == "ACCEPTED"
+        .flat_map(|event| match event {
+            google_calendar3::api::Event {
+                start:
+                    Some(EventDateTime {
+                        date_time: Some(start),
+                        ..
+                    }),
+                end:
+                    Some(EventDateTime {
+                        date_time: Some(end),
+                        ..
+                    }),
+                summary: Some(summary),
+                attendees,
+                ..
+            } => {
+                if let Some(attendees) = attendees {
+                    if let Some(attendee) = attendees.get(0) {
+                        if attendee.response_status == Some("declined".to_string()) {
+                            return None;
                         }
-                        _ => false,
                     }
-                });
-
-            // if !attendee_match {
-            //     return None;
-            // }
-
-            return Some(Event {
-                start,
-                end,
-                summary: event.get_summary()?.to_string(),
-            });
+                }
+                Some(Event {
+                    start: start.clone(),
+                    end: end.clone(),
+                    summary: summary.clone(),
+                })
+            }
+            _ => None,
         })
-        .collect();
-
-    events.sort_by_key(|event| event.start);
+        .collect::<Vec<Event>>();
 
     events.iter().for_each(|event| {
-        println!("{:?}", event);
+        println!("Event: {:?}", event);
     });
 
-    return Ok(());
+    Ok(())
 }
