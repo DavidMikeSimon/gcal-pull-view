@@ -17,17 +17,10 @@ async fn main() -> anyhow::Result<()> {
         .install_default()
         .expect("Failed to install rustls crypto provider");
 
-    // Get an ApplicationSecret instance by some means. It contains the `client_id` and
-    // `client_secret`, among other things.
     let secret: yup_oauth2::ApplicationSecret = yup_oauth2::read_application_secret("secret.json")
         .await
         .unwrap();
 
-    // Instantiate the authenticator. It will choose a suitable authentication flow for you,
-    // unless you replace  `None` with the desired Flow.
-    // Provide your own `AuthenticatorDelegate` to adjust the way it operates and get feedback about
-    // what's going on. You probably want to bring in your own `TokenStorage` to persist tokens and
-    // retrieve them from storage.
     let auth = yup_oauth2::InstalledFlowAuthenticator::builder(
         secret,
         yup_oauth2::InstalledFlowReturnMethod::Interactive,
