@@ -17,3 +17,4 @@ tokio = { version = "1.43.0", features = ["rt-multi-thread"] }
 minicaldav = "0.8.0"
 http-body-util = "0.1.2"
 chrono-tz = "0.10.1"
+rand = "0.8"

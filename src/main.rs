@@ -1,4 +1,7 @@
-use std::collections::HashSet;
+use std::{
+    collections::HashSet,
+    hash::{Hash, Hasher},
+};
 
 use anyhow::Context;
 use chrono::prelude::*;
@@ -6,13 +9,20 @@ use chrono_tz::Tz;
 use google_calendar3::{hyper_rustls, hyper_util, yup_oauth2, CalendarHub};
 use http_body_util::{combinators::BoxBody, BodyExt};
 use hyper::Uri;
-use minicaldav::{self, ical::Ical};
+use minicaldav::{
+    self,
+    ical::{self, Ical},
+};
+use rand::distributions::Alphanumeric;
+use rand::{thread_rng, Rng};
 
 const WINDOW_RADIUS: chrono::TimeDelta = chrono::TimeDelta::days(14);
+const CALDAV_URI: &str =
+    "https://radicale.sinclair.pipsimon.com/simons/6dacfbaf-8788-1a58-6888-64e264e49426/";
+const GOOGLE_CALENDAR_ID: &str = "david.simon@color.com";
 
 #[derive(Debug)]
 struct Event {
-    caldav_uid: Option<String>,
     start: DateTime<Utc>,
     end: DateTime<Utc>,
     summary: String,
@@ -26,32 +36,50 @@ impl PartialEq for Event {
 
 impl Eq for Event {}
 
-impl std::hash::Hash for Event {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+impl Hash for Event {
+    fn hash<H: Hasher>(&self, state: &mut H) {
         self.start.hash(state);
         self.end.hash(state);
         self.summary.hash(state);
     }
 }
 
-const CALDAV_URI: &str =
-    "https://radicale.sinclair.pipsimon.com/simons/6dacfbaf-8788-1a58-6888-64e264e49426/";
-const GOOGLE_CALENDAR_ID: &str = "david.simon@color.com";
+#[derive(Debug)]
+struct EventWithCaldavUid {
+    caldav_uid: String,
+    event: Event,
+}
+
+impl PartialEq for EventWithCaldavUid {
+    fn eq(&self, other: &Self) -> bool {
+        self.event == other.event
+    }
+}
+
+impl Hash for EventWithCaldavUid {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.event.hash(state);
+    }
+}
 
 impl Event {
-    fn to_ical(&self) -> Ical {
-        let mut ical = Ical::new("VEVENT".to_string());
-        ical.properties
-            .push(minicaldav::ical::Property::new("SUMMARY", &self.summary));
-        ical.properties.push(minicaldav::ical::Property::new(
+    fn to_ical(&self, uid: &str) -> Ical {
+        let mut vcalendar = Ical::new("VCALENDAR".to_string());
+        let mut vevent = Ical::new("VEVENT".to_string());
+        vevent.properties.push(ical::Property::new("UID", uid));
+        vevent
+            .properties
+            .push(ical::Property::new("SUMMARY", &self.summary));
+        vevent.properties.push(ical::Property::new(
             "DTSTART",
             &self.start.format("%Y%m%dT%H%M%SZ").to_string(),
         ));
-        ical.properties.push(minicaldav::ical::Property::new(
+        vevent.properties.push(ical::Property::new(
             "DTEND",
             &self.end.format("%Y%m%dT%H%M%SZ").to_string(),
         ));
-        ical
+        vcalendar.children.push(vevent);
+        vcalendar
     }
 }
 
@@ -60,7 +88,7 @@ type HyperClient = hyper_util::client::legacy::Client<
     BoxBody<bytes::Bytes, hyper::Error>,
 >;
 
-fn parse_ical_datetime(property: &minicaldav::ical::Property) -> anyhow::Result<DateTime<Utc>> {
+fn parse_ical_datetime(property: &ical::Property) -> anyhow::Result<DateTime<Utc>> {
     let str = property.value.as_str();
     if str.ends_with('Z') {
         Ok(NaiveDateTime::parse_from_str(property.value.as_str(), "%Y%m%dT%H%M%SZ")?.and_utc())
@@ -83,7 +111,7 @@ fn parse_ical_datetime(property: &minicaldav::ical::Property) -> anyhow::Result<
 fn get_ical_property<'a>(
     ical: &'a Ical,
     property_name: &str,
-) -> anyhow::Result<&'a minicaldav::ical::Property> {
+) -> anyhow::Result<&'a ical::Property> {
     Ok(ical
         .properties
         .iter()
@@ -110,7 +138,11 @@ fn describe_ical_event(event: &Ical) -> String {
     )
 }
 
-async fn fetch_caldav_events(client: &HyperClient) -> anyhow::Result<Vec<Event>> {
+fn describe_event(event: &Event) -> String {
+    format!("'{}' at {}", event.summary, event.start)
+}
+
+async fn fetch_caldav_events(client: &HyperClient) -> anyhow::Result<Vec<EventWithCaldavUid>> {
     let uri = CALDAV_URI.parse::<Uri>()?;
     let result = client.get(uri).await.unwrap();
     let data = String::from_utf8(result.into_body().collect().await?.to_bytes().into())?;
@@ -128,11 +160,13 @@ async fn fetch_caldav_events(client: &HyperClient) -> anyhow::Result<Vec<Event>>
         )
         .map(|ical_event| {
             (|| {
-                Ok::<Event, anyhow::Error>(Event {
-                    caldav_uid: Some(get_ical_property(ical_event, "UID")?.value.clone()),
-                    start: parse_ical_datetime(get_ical_property(ical_event, "DTSTART")?)?,
-                    end: parse_ical_datetime(get_ical_property(ical_event, "DTEND")?)?,
-                    summary: get_ical_property(ical_event, "SUMMARY")?.value.clone(),
+                Ok::<EventWithCaldavUid, anyhow::Error>(EventWithCaldavUid {
+                    caldav_uid: get_ical_property(ical_event, "UID")?.value.clone(),
+                    event: Event {
+                        start: parse_ical_datetime(get_ical_property(ical_event, "DTSTART")?)?,
+                        end: parse_ical_datetime(get_ical_property(ical_event, "DTEND")?)?,
+                        summary: get_ical_property(ical_event, "SUMMARY")?.value.clone(),
+                    },
                 })
             })()
             .with_context(|| {
@@ -142,7 +176,7 @@ async fn fetch_caldav_events(client: &HyperClient) -> anyhow::Result<Vec<Event>>
                 )
             })
         })
-        .filter_map(|result: anyhow::Result<Event>| {
+        .filter_map(|result: anyhow::Result<EventWithCaldavUid>| {
             if let Err(e) = &result {
                 eprintln!("Skipping event: {:#}", e);
             }
@@ -197,7 +231,6 @@ async fn fetch_google_events(client: &HyperClient) -> anyhow::Result<Vec<Event>>
             }
 
             Some(Event {
-                caldav_uid: None,
                 start: google_event.start.as_ref()?.date_time?,
                 end: google_event.end.as_ref()?.date_time?,
                 summary: google_event.summary.as_ref()?.clone(),
@@ -208,16 +241,19 @@ async fn fetch_google_events(client: &HyperClient) -> anyhow::Result<Vec<Event>>
     Ok(events)
 }
 
-fn find_diff<'a>(current: &'a [Event], target: &'a [Event]) -> (Vec<&'a Event>, Vec<&'a Event>) {
-    let current_set: HashSet<&Event> = current.iter().collect();
+fn find_diff<'a>(
+    current: &'a [EventWithCaldavUid],
+    target: &'a [Event],
+) -> (Vec<&'a EventWithCaldavUid>, Vec<&'a Event>) {
+    let current_set: HashSet<&Event> = current.iter().map(|e| &e.event).collect();
     let target_set: HashSet<&Event> = target.iter().collect();
 
     let mut to_delete = Vec::new();
     let mut to_create = Vec::new();
 
-    for event in current {
-        if !target_set.contains(event) {
-            to_delete.push(event);
+    for event_with_caldav_uid in current {
+        if !target_set.contains(&event_with_caldav_uid.event) {
+            to_delete.push(event_with_caldav_uid);
         }
     }
 
@@ -231,18 +267,58 @@ fn find_diff<'a>(current: &'a [Event], target: &'a [Event]) -> (Vec<&'a Event>, 
 }
 
 async fn create_caldav_event(client: &HyperClient, event: &Event) -> anyhow::Result<()> {
-    let uri = CALDAV_URI.parse::<Uri>()?;
+    let random_uid: String = thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(24)
+        .map(char::from)
+        .collect();
+    let uri = (CALDAV_URI.to_owned() + &random_uid + ".ics").parse::<Uri>()?;
+    println!("Creating event {} at {}", describe_event(event), uri);
     let request = hyper::Request::builder()
         .method(hyper::Method::PUT)
         .uri(uri)
         .body(BoxBody::new(
-            http_body_util::Full::new(event.to_ical().serialize().into())
+            http_body_util::Full::new(event.to_ical(random_uid.as_ref()).serialize().into())
                 .map_err(|never| match never {}),
         ))?;
     let result = client.request(request).await?;
-    println!("{:?}", &result);
-    let data = String::from_utf8(result.into_body().collect().await?.to_bytes().into())?;
-    println!("{:?}", &data);
+    if !result.status().is_success() {
+        return Err(anyhow::anyhow!(
+            "Failed to create event {}: {:?}",
+            describe_event(event),
+            result
+        ));
+    }
+    result.into_body().collect().await?; // Is this needed?
+    Ok(())
+}
+
+async fn delete_caldav_event(
+    client: &HyperClient,
+    caldav_event: &EventWithCaldavUid,
+) -> anyhow::Result<()> {
+    let uri = (CALDAV_URI.to_owned() + &caldav_event.caldav_uid + ".ics").parse::<Uri>()?;
+    println!(
+        "Deleting event {} at {}",
+        describe_event(&caldav_event.event),
+        uri
+    );
+    let request = hyper::Request::builder()
+        .method(hyper::Method::DELETE)
+        .uri(uri)
+        .body(BoxBody::new(
+            http_body_util::Full::new(bytes::Bytes::new()).map_err(|never| match never {}),
+        ))?;
+    let result = client.request(request).await?;
+    if !result.status().is_success() {
+        return Err(anyhow::anyhow!(
+            "Failed to delete event {} (uid {}): {:?}",
+            describe_event(&caldav_event.event),
+            caldav_event.caldav_uid,
+            result
+        ));
+    }
+    result.into_body().collect().await?; // Is this needed?
     Ok(())
 }
 
@@ -268,10 +344,19 @@ async fn main() -> anyhow::Result<()> {
 
     let (to_delete, to_create) = find_diff(&caldav_events, &google_events);
 
-    // for event in to_create {
-    //     println!("{:?}", event.to_ical());
-    //     create_caldav_event(&client, event).await?;
-    // }
+    println!(
+        "Sync: {} events to create, {} events to delete",
+        to_create.len(),
+        to_delete.len()
+    );
+
+    for event in to_create {
+        create_caldav_event(&client, event).await?;
+    }
+
+    for event in to_delete {
+        delete_caldav_event(&client, event).await?;
+    }
 
     Ok(())
 }
