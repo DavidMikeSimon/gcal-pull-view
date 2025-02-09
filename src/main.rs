@@ -1,6 +1,8 @@
 use std::{
     collections::HashSet,
     hash::{Hash, Hasher},
+    path::Path,
+    time::Duration,
 };
 
 use anyhow::Context;
@@ -18,7 +20,7 @@ use ureq;
 fn get_window_radius() -> chrono::TimeDelta {
     chrono::TimeDelta::days(
         std::env::var("WINDOW_RADIUS")
-            .unwrap_or("14".to_string())
+            .unwrap_or_else(|_| "14".to_string())
             .parse()
             .unwrap(),
     )
@@ -30,6 +32,10 @@ fn get_caldav_uri() -> String {
 
 fn get_google_calendar_id() -> String {
     std::env::var("GOOGLE_CALENDAR_ID").unwrap()
+}
+
+fn get_google_calendar_secrets_dir() -> String {
+    std::env::var("GOOGLE_CALENDAR_SECRETS_DIR").unwrap_or_else(|_| ".".to_string())
 }
 
 #[derive(Debug)]
@@ -192,15 +198,18 @@ async fn fetch_google_events() -> anyhow::Result<Vec<Event>> {
                 .build(),
         );
 
-    let secret: yup_oauth2::ApplicationSecret = yup_oauth2::read_application_secret("secret.json")
-        .await
-        .unwrap();
+    let secrets_dir = get_google_calendar_secrets_dir();
+
+    let secret: yup_oauth2::ApplicationSecret =
+        yup_oauth2::read_application_secret(Path::new(&secrets_dir).join("secret.json"))
+            .await
+            .unwrap();
 
     let auth = yup_oauth2::InstalledFlowAuthenticator::builder(
         secret,
         yup_oauth2::InstalledFlowReturnMethod::Interactive,
     )
-    .persist_tokens_to_disk("tokens.json")
+    .persist_tokens_to_disk(Path::new(&secrets_dir).join("tokens.json"))
     .build()
     .await
     .unwrap();
@@ -314,11 +323,9 @@ async fn delete_caldav_event(
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .expect("Failed to install rustls crypto provider");
+async fn sync() -> anyhow::Result<()> {
+    let now = chrono::Utc::now();
+    println!("Starting sync at {}", now);
 
     let agent = ureq::Agent::new();
     let caldav_url = get_caldav_uri();
@@ -328,7 +335,7 @@ async fn main() -> anyhow::Result<()> {
     let (to_delete, to_create) = find_diff(&caldav_events, &google_events);
 
     println!(
-        "Sync: {} events to delete, {} events to create",
+        "{} events to delete, {} events to create",
         to_delete.len(),
         to_create.len()
     );
@@ -342,4 +349,14 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let mut interval = tokio::time::interval(Duration::from_secs(60));
+
+    loop {
+        interval.tick().await;
+        sync().await?;
+    }
 }
