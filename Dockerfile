@@ -20,4 +20,6 @@ RUN cargo build --release
 FROM debian:bookworm-20231218-slim
 COPY --from=builder /root/workdir/target/release/gcal_pull_view /usr/bin/gcal_pull_view
 
+RUN apt-get update && apt-get install -y ca-certificates && apt-get clean
+
 CMD ["/usr/bin/gcal_pull_view"]
