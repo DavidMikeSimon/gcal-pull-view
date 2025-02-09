@@ -15,10 +15,22 @@ use rand::distributions::Alphanumeric;
 use rand::{thread_rng, Rng};
 use ureq;
 
-const WINDOW_RADIUS: chrono::TimeDelta = chrono::TimeDelta::days(14);
-const CALDAV_URI: &str =
-    "https://radicale.sinclair.pipsimon.com/simons/6dacfbaf-8788-1a58-6888-64e264e49426/";
-const GOOGLE_CALENDAR_ID: &str = "david.simon@color.com";
+fn get_window_radius() -> chrono::TimeDelta {
+    chrono::TimeDelta::days(
+        std::env::var("WINDOW_RADIUS")
+            .unwrap_or("14".to_string())
+            .parse()
+            .unwrap(),
+    )
+}
+
+fn get_caldav_uri() -> String {
+    std::env::var("CALDAV_URI").unwrap()
+}
+
+fn get_google_calendar_id() -> String {
+    std::env::var("GOOGLE_CALENDAR_ID").unwrap()
+}
 
 #[derive(Debug)]
 struct Event {
@@ -47,18 +59,6 @@ impl Hash for Event {
 struct EventWithCaldavUid {
     caldav_uid: String,
     event: Event,
-}
-
-impl PartialEq for EventWithCaldavUid {
-    fn eq(&self, other: &Self) -> bool {
-        self.event == other.event
-    }
-}
-
-impl Hash for EventWithCaldavUid {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.event.hash(state);
-    }
 }
 
 impl Event {
@@ -136,8 +136,11 @@ fn describe_event(event: &Event) -> String {
     format!("'{}' at {}", event.summary, event.start)
 }
 
-async fn fetch_caldav_events(agent: &ureq::Agent) -> anyhow::Result<Vec<EventWithCaldavUid>> {
-    let data = agent.get(CALDAV_URI).call()?.into_string()?;
+async fn fetch_caldav_events(
+    agent: &ureq::Agent,
+    caldav_url: &str,
+) -> anyhow::Result<Vec<EventWithCaldavUid>> {
+    let data = agent.get(caldav_url).call()?.into_string()?;
     let events = minicaldav::parse_ical(&data)?;
     Ok(events
         .children
@@ -202,17 +205,18 @@ async fn fetch_google_events() -> anyhow::Result<Vec<Event>> {
     .await
     .unwrap();
     let hub = CalendarHub::new(client.clone(), auth);
+    let window_radius = get_window_radius();
 
     let result = hub
         .events()
-        .list(GOOGLE_CALENDAR_ID)
+        .list(&get_google_calendar_id())
         .add_event_types("default")
         .max_results(2500)
         .single_events(true)
         .order_by("startTime")
         .max_attendees(1)
-        .time_min(now - WINDOW_RADIUS)
-        .time_max(now + WINDOW_RADIUS)
+        .time_min(now - window_radius)
+        .time_max(now + window_radius)
         .doit()
         .await?
         .1;
@@ -267,13 +271,17 @@ fn find_diff<'a>(
     (to_delete, to_create)
 }
 
-async fn create_caldav_event(agent: &ureq::Agent, event: &Event) -> anyhow::Result<()> {
+async fn create_caldav_event(
+    agent: &ureq::Agent,
+    caldav_url: &str,
+    event: &Event,
+) -> anyhow::Result<()> {
     let random_uid: String = thread_rng()
         .sample_iter(&Alphanumeric)
         .take(24)
         .map(char::from)
         .collect();
-    let uri = format!("{}{}.ics", CALDAV_URI, random_uid);
+    let uri = format!("{}{}.ics", caldav_url, random_uid);
     println!("Creating event {} at {}", describe_event(event), uri);
 
     agent
@@ -286,9 +294,10 @@ async fn create_caldav_event(agent: &ureq::Agent, event: &Event) -> anyhow::Resu
 
 async fn delete_caldav_event(
     agent: &ureq::Agent,
+    caldav_url: &str,
     caldav_event: &EventWithCaldavUid,
 ) -> anyhow::Result<()> {
-    let uri = format!("{}{}.ics", CALDAV_URI, caldav_event.caldav_uid);
+    let uri = format!("{}{}.ics", caldav_url, caldav_event.caldav_uid);
     println!(
         "Deleting event {} at {}",
         describe_event(&caldav_event.event),
@@ -312,8 +321,9 @@ async fn main() -> anyhow::Result<()> {
         .expect("Failed to install rustls crypto provider");
 
     let agent = ureq::Agent::new();
+    let caldav_url = get_caldav_uri();
 
-    let caldav_events = fetch_caldav_events(&agent).await?;
+    let caldav_events = fetch_caldav_events(&agent, &caldav_url).await?;
     let google_events = fetch_google_events().await?;
     let (to_delete, to_create) = find_diff(&caldav_events, &google_events);
 
@@ -324,11 +334,11 @@ async fn main() -> anyhow::Result<()> {
     );
 
     for event in to_delete {
-        delete_caldav_event(&agent, event).await?;
+        delete_caldav_event(&agent, &caldav_url, event).await?;
     }
 
     for event in to_create {
-        create_caldav_event(&agent, event).await?;
+        create_caldav_event(&agent, &caldav_url, event).await?;
     }
 
     Ok(())
