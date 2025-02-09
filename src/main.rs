@@ -7,14 +7,13 @@ use anyhow::Context;
 use chrono::prelude::*;
 use chrono_tz::Tz;
 use google_calendar3::{hyper_rustls, hyper_util, yup_oauth2, CalendarHub};
-use http_body_util::{combinators::BoxBody, BodyExt};
-use hyper::Uri;
 use minicaldav::{
     self,
     ical::{self, Ical},
 };
 use rand::distributions::Alphanumeric;
 use rand::{thread_rng, Rng};
+use ureq;
 
 const WINDOW_RADIUS: chrono::TimeDelta = chrono::TimeDelta::days(14);
 const CALDAV_URI: &str =
@@ -83,11 +82,6 @@ impl Event {
     }
 }
 
-type HyperClient = hyper_util::client::legacy::Client<
-    hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
-    BoxBody<bytes::Bytes, hyper::Error>,
->;
-
 fn parse_ical_datetime(property: &ical::Property) -> anyhow::Result<DateTime<Utc>> {
     let str = property.value.as_str();
     if str.ends_with('Z') {
@@ -142,10 +136,8 @@ fn describe_event(event: &Event) -> String {
     format!("'{}' at {}", event.summary, event.start)
 }
 
-async fn fetch_caldav_events(client: &HyperClient) -> anyhow::Result<Vec<EventWithCaldavUid>> {
-    let uri = CALDAV_URI.parse::<Uri>()?;
-    let result = client.get(uri).await.unwrap();
-    let data = String::from_utf8(result.into_body().collect().await?.to_bytes().into())?;
+async fn fetch_caldav_events(agent: &ureq::Agent) -> anyhow::Result<Vec<EventWithCaldavUid>> {
+    let data = agent.get(CALDAV_URI).call()?.into_string()?;
     let events = minicaldav::parse_ical(&data)?;
     Ok(events
         .children
@@ -185,8 +177,17 @@ async fn fetch_caldav_events(client: &HyperClient) -> anyhow::Result<Vec<EventWi
         .collect())
 }
 
-async fn fetch_google_events(client: &HyperClient) -> anyhow::Result<Vec<Event>> {
+async fn fetch_google_events() -> anyhow::Result<Vec<Event>> {
     let now = chrono::Utc::now();
+    let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+        .build(
+            hyper_rustls::HttpsConnectorBuilder::new()
+                .with_native_roots()
+                .unwrap()
+                .https_or_http()
+                .enable_http1()
+                .build(),
+        );
 
     let secret: yup_oauth2::ApplicationSecret = yup_oauth2::read_application_secret("secret.json")
         .await
@@ -266,59 +267,41 @@ fn find_diff<'a>(
     (to_delete, to_create)
 }
 
-async fn create_caldav_event(client: &HyperClient, event: &Event) -> anyhow::Result<()> {
+async fn create_caldav_event(agent: &ureq::Agent, event: &Event) -> anyhow::Result<()> {
     let random_uid: String = thread_rng()
         .sample_iter(&Alphanumeric)
         .take(24)
         .map(char::from)
         .collect();
-    let uri = (CALDAV_URI.to_owned() + &random_uid + ".ics").parse::<Uri>()?;
+    let uri = format!("{}{}.ics", CALDAV_URI, random_uid);
     println!("Creating event {} at {}", describe_event(event), uri);
-    let request = hyper::Request::builder()
-        .method(hyper::Method::PUT)
-        .uri(uri)
-        .body(BoxBody::new(
-            http_body_util::Full::new(event.to_ical(random_uid.as_ref()).serialize().into())
-                .map_err(|never| match never {}),
-        ))?;
-    let result = client.request(request).await?;
-    if !result.status().is_success() {
-        return Err(anyhow::anyhow!(
-            "Failed to create event {}: {:?}",
-            describe_event(event),
-            result
-        ));
-    }
-    result.into_body().collect().await?; // Is this needed?
+
+    agent
+        .put(&uri)
+        .send_string(&event.to_ical(&random_uid).serialize())
+        .with_context(|| format!("Failed to create event {}", describe_event(event)))?;
+
     Ok(())
 }
 
 async fn delete_caldav_event(
-    client: &HyperClient,
+    agent: &ureq::Agent,
     caldav_event: &EventWithCaldavUid,
 ) -> anyhow::Result<()> {
-    let uri = (CALDAV_URI.to_owned() + &caldav_event.caldav_uid + ".ics").parse::<Uri>()?;
+    let uri = format!("{}{}.ics", CALDAV_URI, caldav_event.caldav_uid);
     println!(
         "Deleting event {} at {}",
         describe_event(&caldav_event.event),
         uri
     );
-    let request = hyper::Request::builder()
-        .method(hyper::Method::DELETE)
-        .uri(uri)
-        .body(BoxBody::new(
-            http_body_util::Full::new(bytes::Bytes::new()).map_err(|never| match never {}),
-        ))?;
-    let result = client.request(request).await?;
-    if !result.status().is_success() {
-        return Err(anyhow::anyhow!(
-            "Failed to delete event {} (uid {}): {:?}",
-            describe_event(&caldav_event.event),
-            caldav_event.caldav_uid,
-            result
-        ));
-    }
-    result.into_body().collect().await?; // Is this needed?
+
+    agent.delete(&uri).call().with_context(|| {
+        format!(
+            "Failed to delete event {}",
+            describe_event(&caldav_event.event)
+        )
+    })?;
+
     Ok(())
 }
 
@@ -328,34 +311,24 @@ async fn main() -> anyhow::Result<()> {
         .install_default()
         .expect("Failed to install rustls crypto provider");
 
-    let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-        .build(
-            hyper_rustls::HttpsConnectorBuilder::new()
-                .with_native_roots()
-                .unwrap()
-                .https_or_http()
-                .enable_http1()
-                .build(),
-        );
+    let agent = ureq::Agent::new();
 
-    let caldav_events = fetch_caldav_events(&client).await?;
-
-    let google_events = fetch_google_events(&client).await?;
-
+    let caldav_events = fetch_caldav_events(&agent).await?;
+    let google_events = fetch_google_events().await?;
     let (to_delete, to_create) = find_diff(&caldav_events, &google_events);
 
     println!(
-        "Sync: {} events to create, {} events to delete",
-        to_create.len(),
-        to_delete.len()
+        "Sync: {} events to delete, {} events to create",
+        to_delete.len(),
+        to_create.len()
     );
 
-    for event in to_create {
-        create_caldav_event(&client, event).await?;
+    for event in to_delete {
+        delete_caldav_event(&agent, event).await?;
     }
 
-    for event in to_delete {
-        delete_caldav_event(&client, event).await?;
+    for event in to_create {
+        create_caldav_event(&agent, event).await?;
     }
 
     Ok(())
