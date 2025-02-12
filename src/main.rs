@@ -207,7 +207,7 @@ async fn fetch_google_events() -> anyhow::Result<Vec<Event>> {
 
     let auth = yup_oauth2::InstalledFlowAuthenticator::builder(
         secret,
-        yup_oauth2::InstalledFlowReturnMethod::Interactive,
+        yup_oauth2::InstalledFlowReturnMethod::HTTPRedirect,
     )
     .persist_tokens_to_disk(Path::new(&secrets_dir).join("tokens.json"))
     .build()
