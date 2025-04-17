@@ -186,6 +186,27 @@ async fn fetch_caldav_events(
         .collect())
 }
 
+fn is_not_accepted(google_event: &google_calendar3::api::Event) -> bool {
+    google_event.attendees.iter().flatten().any(|attendee| {
+        match attendee.response_status.as_ref() {
+            Some(status) if status == "declined" => true,
+            Some(status) if status == "needsAction" => true,
+            _ => false,
+        }
+    })
+}
+
+const PASSIVE_EVENTS: [&str; 4] = ["Color Coordinated", "All Hands", "Async Eng", "TCIF"];
+
+fn is_passive_event(google_event: &google_calendar3::api::Event) -> bool {
+    let summary = match google_event.summary.as_ref() {
+        Some(summary) => summary,
+        None => return false,
+    };
+
+    PASSIVE_EVENTS.iter().any(|event| summary.contains(event))
+}
+
 async fn fetch_google_events() -> anyhow::Result<Vec<Event>> {
     let now = chrono::Utc::now();
     let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
@@ -235,13 +256,16 @@ async fn fetch_google_events() -> anyhow::Result<Vec<Event>> {
         .with_context(|| "Calendar events should exist")?
         .iter()
         .filter_map(|google_event| {
-            if google_event
-                .attendees
-                .iter()
-                .flatten()
-                .any(|attendee| attendee.response_status == Some("declined".to_string()))
-            {
+            if is_not_accepted(google_event) {
                 return None;
+            }
+
+            if is_passive_event(google_event) {
+                return None;
+            }
+
+            if google_event.summary.as_ref()?.contains("Product Design") {
+                println!("{:#?}", google_event);
             }
 
             Some(Event {
